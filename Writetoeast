@@ -1,0 +1,66 @@
+from __future__ import annotations
+
+import os
+from datetime import datetime
+
+from airflow import DAG
+from airflow.providers.google.cloud.operators.bigquery import BigQueryInsertJobOperator
+from airflow.providers.google.cloud.operators.gcs import GCSToBigQueryOperator
+from airflow.utils.trigger_rule import TriggerRule
+
+GCP_PROJECT_ID = os.environ.get("GCP_PROJECT_ID", "your-gcp-project-id")
+BQ_DATASET = os.environ.get("BQ_DATASET", "your_dataset")
+BQ_TABLE_NAME = os.environ.get("BQ_TABLE_NAME", "your_target_table")
+TEMP_TABLE_NAME = os.environ.get("TEMP_TABLE_NAME", "temp_table")
+GCS_BUCKET = os.environ.get("GCS_BUCKET", "your-gcs-bucket")
+GCS_FILE_NAME = os.environ.get("GCS_FILE_NAME", "your_data.csv")
+RESERVATION_ID = os.environ.get("RESERVATION_ID", "your_enterprise_plus_reservation_id")
+
+with DAG(
+    dag_id="bigquery_managed_dr_composer2",
+    schedule=None,  # Triggered manually
+    start_date=datetime(2024, 1, 1),
+    catchup=False,
+    tags=["bigquery", "disaster_recovery", "composer2"],
+) as dag:
+    # Task 1: Load the full file into a temporary BigQuery table in us-east1
+    load_temp_table_task = GCSToBigQueryOperator(
+        task_id="load_temp_table",
+        bucket=GCS_BUCKET,
+        source_objects=[GCS_FILE_NAME],
+        destination_project_dataset_table=f"{GCP_PROJECT_ID}.{BQ_DATASET}.{TEMP_TABLE_NAME}",
+        source_format="CSV",
+        skip_leading_rows=1,  # Skip the header row
+        write_disposition="WRITE_TRUNCATE",  # Overwrite the temp table if it exists
+        autodetect=True,  # Automatically detect schema
+        location="us-east1",  # Explicitly set the location to us-east1
+        gcp_conn_id="google_cloud_default",  # Airflow connection ID for GCP
+    )
+
+    # Task 2: Insert 10% of the data from the temporary table into the target table in us-east1
+    insert_sample_data_task = BigQueryInsertJobOperator(
+        task_id="insert_sample_data",
+        configuration={
+            "query": {
+                "query": f"""
+                    INSERT INTO `{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_TABLE_NAME}`
+                    SELECT *
+                    FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{TEMP_TABLE_NAME}`
+                    WHERE RAND() < 0.1
+                """,
+                "useLegacySql": False,  # Use standard SQL
+            }
+        },
+        hook_params={
+            "configuration": {
+                "jobReference": {
+                    "reservationId": RESERVATION_ID,  # Specify the reservation ID
+                }
+            }
+        },
+        location="us-east1",  # Explicitly set the location to us-east1
+        gcp_conn_id="google_cloud_default",  # Airflow connection ID for GCP
+    )
+
+    # Define task dependencies
+    load_temp_table_task >> insert_sample_data_task
